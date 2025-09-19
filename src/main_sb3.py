@@ -87,7 +87,7 @@ def main():
         env,
         learning_rate=1e-3,
         buffer_size=5000,
-        learning_starts=100,
+        learning_starts=0,
         batch_size=64,
         gamma=1.0,
         train_freq=1,
