@@ -1,4 +1,3 @@
-# log_utils.py
 import csv, os, time
 
 class EpisodeLogger:
