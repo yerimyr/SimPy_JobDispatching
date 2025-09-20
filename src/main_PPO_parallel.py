@@ -141,7 +141,7 @@ import numpy as np
 import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
 from environment import JobRoutingGymEnv, Config
-from PPO import PPOAgent   # 네가 만든 PPO.py 안에 있는 PPOAgent
+from PPO import PPOAgent   
 
 N_EPISODES = 1000
 
