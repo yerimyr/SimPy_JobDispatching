@@ -37,9 +37,10 @@ def main():
     writer = SummaryWriter(logdir)
     print(f"[TensorBoard] logging to {logdir}")
 
-    cfg = Config(SEED=0)
+    cfg = Config()
+    cfg.SEED = 0
     env = JobRoutingGymEnv(cfg)
-    eval_env = JobRoutingGymEnv(Config(SEED=123))
+    eval_env = JobRoutingGymEnv(cfg)
 
     state_dim = env.observation_space.shape[0]
     n_actions = env.action_space.n

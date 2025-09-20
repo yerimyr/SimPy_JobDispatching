@@ -43,7 +43,10 @@ def run_episode(env: JobRoutingGymEnv, episode_idx: int):
 
 
 def main():
-    cfg = Config(SEED=42, NUM_JOBS=NUM_JOBS)
+    cfg = Config()
+    cfg.SEED = 42
+    cfg.NUM_JOBS = 20
+
     env = JobRoutingGymEnv(cfg)
 
     for ep in range(1, N_EPISODES + 1):

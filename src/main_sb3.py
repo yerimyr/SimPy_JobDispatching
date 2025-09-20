@@ -12,7 +12,9 @@ from log import EpisodeLogger
 N_EPISODES = 1000
 
 def make_env(SEED=0):
-    env = JobRoutingGymEnv(Config(SEED=SEED))
+    cfg = Config()
+    cfg.SEED = 0
+    env = JobRoutingGymEnv(cfg)
     env = Monitor(env)  
     return env
 
@@ -72,7 +74,8 @@ class TensorboardEpisodeCallback(BaseCallback):
 
 
 def main():
-    cfg = Config(SEED=0)
+    cfg = Config()
+    cfg.SEED = 0
     NUM_JOBS = cfg.NUM_JOBS
     total_timesteps = NUM_JOBS * N_EPISODES
 

@@ -4,15 +4,29 @@ import simpy
 from dataclasses import dataclass
 import gymnasium as gym
 from gymnasium import spaces
+import torch
 
 
 @dataclass
 class Config:
-    NUM_SERVERS: int = 3
-    NUM_JOBS: int = 20
-    INTERARRIVAL_SEC: float = 60
-    PROC_TIME_SEC: float = 180
-    SEED: int = 0
+    NUM_SERVERS = 3
+    NUM_JOBS = 20
+    INTERARRIVAL_SEC = 60
+    PROC_TIME_SEC = 180
+    SEED = 0
+    
+    LEARNING_RATE = 1e-3
+    GAMMA = 0.99
+    CLIP_EPSILON = 0.2
+    UPDATE_STEPS = 10
+    GAE_LAMBDA = 0.95
+    ENT_COEF = 0.01
+    VF_COEF = 0.5
+    MAX_GRAD_NORM = 0.5
+    BATCH_SIZE = 20
+    
+    #DEVICE = "cpu"
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class JobRoutingSimPyEnv:
 
@@ -30,13 +44,16 @@ class JobRoutingSimPyEnv:
         self.servers = [simpy.Resource(self.env, capacity=1)
                         for _ in range(self.cfg.NUM_SERVERS)]
 
-        self.jobs_generated = 0
-        self.jobs_completed = 0
-        self.last_obs = None
-        self.pending_job = None   
+        self.jobs_generated = 0  # 지금까지 도착한 총 job의 개수
+        self.jobs_completed = 0  # 지금까지 완료된 총 job의 개수
+        self.last_obs = None  # 상태 전이 관리
+        self.pending_job = None  # 아직 server에 배정되지 않고 대기 중인 job을 담아둠
 
         self.env.process(self._job_arrival_proc())
         self.server_finish_times = [0.0 for _ in range(self.cfg.NUM_SERVERS)]
+        
+        self.on_job_finish = None
+
 
     def _job_arrival_proc(self):
         for i in range(self.cfg.NUM_JOBS):
@@ -46,41 +63,48 @@ class JobRoutingSimPyEnv:
             self.pending_job = {"id": i, "arrival_time": self.env.now}
 
             while self.pending_job is not None:
-                yield self.env.timeout(0)
+                yield self.env.timeout(0)  # 다른 프로세스에게 양보
 
 
     def _job_process(self, server_id: int, job_id: int):
-        with self.servers[server_id].request() as req:
-            yield req
+        with self.servers[server_id].request() as req:  # server에 요청 이벤트를 전달
+            yield req  # 이 요청 req이 완료되어 server 리소스를 점유할 때까지 기다림
             finish_time = self.env.now + self.cfg.PROC_TIME_SEC
-            self.server_finish_times[server_id] = finish_time
-            yield self.env.timeout(self.cfg.PROC_TIME_SEC)
+            self.server_finish_times[server_id] = finish_time  # 예상 종료 시각을 서버 별 상태 배열에 기록
+            yield self.env.timeout(self.cfg.PROC_TIME_SEC)  # 처리 시간만큼 진행
             self.jobs_completed += 1
-            self.server_finish_times[server_id] = 0.0
+            self.server_finish_times[server_id] = 0.0  # 해당 서버가 대기 상태가 되었음을 표시
 
+            if self.on_job_finish is not None:
+                self.on_job_finish(job_id, server_id, self.env.now)
 
     def _observe(self):
-        r, q = [], []
+        r, q = [], []  # 각 서버의 남은 처리 시간, 각 서버의 대기열 길이를 담을 리스트
         for k, s in enumerate(self.servers):
             remain = max(0.0, self.server_finish_times[k] - self.env.now)
             qk = len(s.queue)
             r.append(remain)
             q.append(qk)
-        obs = np.array([
-            r[0], r[1], r[2],
-            q[0], q[1], q[2],
-            float(self.jobs_completed),
-            float(self.env.now)
-        ], dtype=np.float32)
+        obs = np.array(
+            r + q + [float(self.jobs_completed), float(self.env.now)],
+            dtype=np.float32
+        )
         self.last_obs = obs
         return obs
 
 
     def _reward(self, obs, action):
-            r = obs[:3]
-            q = obs[3:6]
-            pk = np.array([r[i] + (q[i]+1)*self.cfg.PROC_TIME_SEC for i in range(3)])
-            return float(pk.min() - pk[int(action)])
+        num_servers = self.cfg.NUM_SERVERS
+        r = obs[:num_servers]               # 남은 처리시간 벡터
+        q = obs[num_servers:2*num_servers]  # 큐 길이 벡터
+
+        pk = np.array([
+            r[i] + (q[i] + 1) * self.cfg.PROC_TIME_SEC
+            for i in range(num_servers)
+        ])
+
+        return float(pk.min() - pk[int(action)])
+
         
     def reset(self, SEED: int | None = None):
         if SEED is not None:
@@ -101,7 +125,7 @@ class JobRoutingSimPyEnv:
             self.env.step()
 
         if self.pending_job is None and self.jobs_generated >= self.cfg.NUM_JOBS:
-            while any(len(s.users) > 0 or len(s.queue) > 0 for s in self.servers):
+            while any(len(s.users) > 0 or len(s.queue) > 0 for s in self.servers): 
                 self.env.step()
             obs = self._observe()
             reward = 0.0
@@ -123,11 +147,11 @@ class JobRoutingSimPyEnv:
             )
         ):
             self.env.step()
-
+            
         obs = self._observe()
         done = (
             self.jobs_completed == self.cfg.NUM_JOBS
-            and all(len(s.users) == 0 for s in self.servers)
+            and all(len(s.users) == 0 and len(s.queue) == 0 for s in self.servers)
         )
         info = {"completed": self.jobs_completed}
         return obs, reward, done, info
@@ -139,19 +163,20 @@ class JobRoutingGymEnv(gym.Env):
     def __init__(self, config: Config | None = None):
         super().__init__()
         self.core = JobRoutingSimPyEnv(config)
+        num_servers = self.core.cfg.NUM_SERVERS
 
-        high = np.array([
-            self.core.cfg.PROC_TIME_SEC,  # r1
-            self.core.cfg.PROC_TIME_SEC,  # r2
-            self.core.cfg.PROC_TIME_SEC,  # r3
-            self.core.cfg.NUM_JOBS,       # q1
-            self.core.cfg.NUM_JOBS,       # q2
-            self.core.cfg.NUM_JOBS,       # q3
-            self.core.cfg.NUM_JOBS,       # completed
+        r_high = [self.core.cfg.PROC_TIME_SEC] * num_servers
+
+        q_high = [self.core.cfg.NUM_JOBS] * num_servers
+
+        completed_high = [self.core.cfg.NUM_JOBS]
+
+        time_high = [
             self.core.cfg.NUM_JOBS * self.core.cfg.INTERARRIVAL_SEC
-            + self.core.cfg.NUM_JOBS * self.core.cfg.PROC_TIME_SEC  # time
-        ], dtype=np.float32)
+            + self.core.cfg.NUM_JOBS * self.core.cfg.PROC_TIME_SEC
+        ]
 
+        high = np.array(r_high + q_high + completed_high + time_high, dtype=np.float32)
         low = np.zeros_like(high, dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
