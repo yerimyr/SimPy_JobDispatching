@@ -4,6 +4,9 @@ import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
 from environment import JobRoutingGymEnv, Config
 from DQN import DQNAgent, BATCH_SIZE
+np.set_printoptions(suppress=True, precision=2,
+                    formatter={'float_kind': lambda x: f"{x:.2f}"})
+
 
 N_EPISODES = 1000 
 
@@ -54,13 +57,14 @@ def main():
     obs, _ = env.reset()
     ep_ret, ep_len = 0.0, 0
     ep_count = 0
-    ep_loss_sum, ep_loss_count = 0.0, 0   # loss 기록용
+    ep_loss_sum, ep_loss_count = 0.0, 0   
 
     for t in range(1, total_timesteps + 1):
         action = agent.select_action(obs)
         obs2, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         agent.replay_buffer.push(obs, action, reward, obs2, done)
+        #print(obs, action, reward, obs2, done)
 
         loss = agent.update(batch_size=BATCH_SIZE)
         if loss is not None:
@@ -83,7 +87,7 @@ def main():
 
             obs, _ = env.reset()
             ep_ret, ep_len = 0.0, 0
-            ep_loss_sum, ep_loss_count = 0.0, 0   # 초기화
+            ep_loss_sum, ep_loss_count = 0.0, 0   
 
     mean_ret, std_ret = evaluate(agent, eval_env, n_episodes=20)
     print(f"[EVAL] Return mean={int(mean_ret):,} ± {int(std_ret):,}")

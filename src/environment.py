@@ -14,21 +14,37 @@ class Config:
     INTERARRIVAL_SEC = 60
     PROC_TIME_SEC = 180
     SEED = 0
-    
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 0.0003
     GAMMA = 0.99
-    CLIP_EPSILON = 0.2
-    UPDATE_STEPS = 10
+    CLIP_EPSILON = 0.03
+    UPDATE_STEPS = 8
     GAE_LAMBDA = 0.95
     ENT_COEF = 0.01
     VF_COEF = 0.5
     MAX_GRAD_NORM = 0.5
     BATCH_SIZE = 20
+    HIDDEN_SIZE = 32
     
     #DEVICE = "cpu"
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class JobRoutingSimPyEnv:
+    """
+    Simulation environment for job routing using SimPy.
+    It models multiple servers, job arrivals, and job processing dynamics.
+
+    Attributes:
+        cfg (Config): Configuration object with simulation parameters.
+        rng (np.random.Generator): Random number generator initialized with the given seed.
+        env (simpy.Environment): SimPy environment to simulate time progression.
+        servers (list[simpy.Resource]): List of servers handling job processing.
+        jobs_generated (int): Number of jobs that have arrived so far.
+        jobs_completed (int): Number of jobs that have been completed so far.
+        last_obs (np.ndarray): Last observed state vector.
+        pending_job (dict | None): Job waiting to be assigned to a server.
+        server_finish_times (list[float]): Finish time for each server.
+        on_job_finish (callable | None): Callback function triggered when a job finishes.
+    """
 
     KEYS = [
         "S1_Remain", "S2_Remain", "S3_Remain",
@@ -44,18 +60,21 @@ class JobRoutingSimPyEnv:
         self.servers = [simpy.Resource(self.env, capacity=1)
                         for _ in range(self.cfg.NUM_SERVERS)]
 
-        self.jobs_generated = 0  # 지금까지 도착한 총 job의 개수
-        self.jobs_completed = 0  # 지금까지 완료된 총 job의 개수
-        self.last_obs = None  # 상태 전이 관리
-        self.pending_job = None  # 아직 server에 배정되지 않고 대기 중인 job을 담아둠
+        self.jobs_generated = 0  
+        self.jobs_completed = 0  
+        self.last_obs = None  
+        self.pending_job = None  
 
         self.env.process(self._job_arrival_proc())
         self.server_finish_times = [0.0 for _ in range(self.cfg.NUM_SERVERS)]
         
         self.on_job_finish = None
-
-
+        
     def _job_arrival_proc(self):
+        """
+        Job arrival process that generates jobs at fixed interarrival times.
+        New jobs are stored in `pending_job` until assigned to a server.
+        """
         for i in range(self.cfg.NUM_JOBS):
             if i > 0:
                 yield self.env.timeout(self.cfg.INTERARRIVAL_SEC)
@@ -63,23 +82,36 @@ class JobRoutingSimPyEnv:
             self.pending_job = {"id": i, "arrival_time": self.env.now}
 
             while self.pending_job is not None:
-                yield self.env.timeout(0)  # 다른 프로세스에게 양보
-
+                yield self.env.timeout(0)  
 
     def _job_process(self, server_id: int, job_id: int):
-        with self.servers[server_id].request() as req:  # server에 요청 이벤트를 전달
-            yield req  # 이 요청 req이 완료되어 server 리소스를 점유할 때까지 기다림
+        """
+        Simulate processing of a job by a specific server.
+
+        Args:
+            server_id (int): ID of the server that processes the job.
+            job_id (int): ID of the job being processed.
+        """
+        with self.servers[server_id].request() as req:  
+            yield req  
             finish_time = self.env.now + self.cfg.PROC_TIME_SEC
-            self.server_finish_times[server_id] = finish_time  # 예상 종료 시각을 서버 별 상태 배열에 기록
-            yield self.env.timeout(self.cfg.PROC_TIME_SEC)  # 처리 시간만큼 진행
+            self.server_finish_times[server_id] = finish_time  
+            yield self.env.timeout(self.cfg.PROC_TIME_SEC)  
             self.jobs_completed += 1
-            self.server_finish_times[server_id] = 0.0  # 해당 서버가 대기 상태가 되었음을 표시
+            self.server_finish_times[server_id] = 0.0  
 
             if self.on_job_finish is not None:
                 self.on_job_finish(job_id, server_id, self.env.now)
 
     def _observe(self):
-        r, q = [], []  # 각 서버의 남은 처리 시간, 각 서버의 대기열 길이를 담을 리스트
+        """
+        Construct the current observation of the environment state.
+
+        Returns:
+            np.ndarray: State vector including server remaining times,
+                        queue lengths, completed jobs, and current time.
+        """
+        r, q = [], []  
         for k, s in enumerate(self.servers):
             remain = max(0.0, self.server_finish_times[k] - self.env.now)
             qk = len(s.queue)
@@ -92,12 +124,20 @@ class JobRoutingSimPyEnv:
         self.last_obs = obs
         return obs
 
-
     def _reward(self, obs, action):
-        num_servers = self.cfg.NUM_SERVERS
-        r = obs[:num_servers]               # 남은 처리시간 벡터
-        q = obs[num_servers:2*num_servers]  # 큐 길이 벡터
+        """
+        Compute the reward for assigning the pending job to a server.
 
+        Args:
+            obs (np.ndarray): Current observation of the system.
+            action (int): Selected server ID.
+
+        Returns:
+            float: Reward value.
+        """
+        num_servers = self.cfg.NUM_SERVERS
+        r = obs[:num_servers]               
+        q = obs[num_servers:2*num_servers]  
         pk = np.array([
             r[i] + (q[i] + 1) * self.cfg.PROC_TIME_SEC
             for i in range(num_servers)
@@ -105,8 +145,16 @@ class JobRoutingSimPyEnv:
 
         return float(pk.min() - pk[int(action)])
 
-        
     def reset(self, SEED: int | None = None):
+        """
+        Reset the environment to its initial state.
+
+        Args:
+            SEED (int | None): Optional random seed for reproducibility.
+
+        Returns:
+            np.ndarray: Initial observation after reset.
+        """
         if SEED is not None:
             self.rng = np.random.default_rng(SEED)
         self.env = simpy.Environment()
@@ -120,7 +168,20 @@ class JobRoutingSimPyEnv:
         return self._observe()
 
     def step(self, action: int):
-        
+        """
+        Take one step in the environment by assigning the pending job
+        to the specified server.
+
+        Args:
+            action (int): ID of the server to assign the job to.
+
+        Returns:
+            tuple:
+                - obs (np.ndarray): Next observation.
+                - reward (float): Reward for the chosen action.
+                - done (bool): Whether the episode has finished.
+                - info (dict): Additional information (e.g., number of completed jobs).
+        """
         while self.pending_job is None and self.jobs_generated < self.cfg.NUM_JOBS:
             self.env.step()
 
@@ -158,6 +219,15 @@ class JobRoutingSimPyEnv:
 
 
 class JobRoutingGymEnv(gym.Env): 
+    """
+    OpenAI GymWrapper for the Job Routing environment.
+    This class provides a Gym API on top of the SimPy-based simulation.
+
+    Attributes:
+        core (JobRoutingSimPyEnv): Core simulation environment.
+        observation_space (gym.spaces.Box): Continuous observation space for states.
+        action_space (gym.spaces.Discrete): Discrete action space (server selection).
+    """
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, config: Config | None = None):

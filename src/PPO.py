@@ -15,7 +15,7 @@ class ActorCritic(nn.Module):
         action_dims: List containing the number of discrete actions per action dimension.
         hidden_size: Number of neurons in hidden layers.
     """
-    def __init__(self, state_dim, action_dims, hidden_size=64):
+    def __init__(self, state_dim, action_dims, hidden_size=Config.HIDDEN_SIZE):
         super(ActorCritic, self).__init__()
         self.action_dims = action_dims
 
@@ -71,7 +71,7 @@ class PPOAgent:
         update_steps: Number of training epochs per update.
     """
     def __init__(self, state_dim, action_dims, lr=Config.LEARNING_RATE, gamma=Config.GAMMA, clip_epsilon=Config.CLIP_EPSILON, update_steps=Config.UPDATE_STEPS,
-                gae_lambda=Config.GAE_LAMBDA, ent_coef=Config.ENT_COEF, vf_coef=Config.VF_COEF, max_grad_norm=Config.MAX_GRAD_NORM):
+                gae_lambda=Config.GAE_LAMBDA, ent_coef=Config.ENT_COEF, vf_coef=Config.VF_COEF, max_grad_norm=Config.MAX_GRAD_NORM, hidden_size=Config.HIDDEN_SIZE):
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_steps = update_steps
@@ -81,7 +81,7 @@ class PPOAgent:
         self.max_grad_norm = max_grad_norm    
         self.device = Config.DEVICE
     
-        self.policy = ActorCritic(state_dim, action_dims).to(self.device)
+        self.policy = ActorCritic(state_dim, action_dims, hidden_size=hidden_size).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.memory = []
         
