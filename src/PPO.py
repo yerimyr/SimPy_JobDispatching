@@ -1,303 +1,324 @@
+import time, math
+from typing import List, Tuple, Optional
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from torch.distributions import Categorical
-from environment import *
-import time
+from environment import Config
+
+cfg = Config()
+STATE_DIM = cfg.STATE_DIM
+N_ACTIONS = cfg.N_ACTIONS
+PPO_LEARNING_RATE = cfg.LEARNING_RATE
+PPO_GAMMA = cfg.GAMMA
+PPO_CLIP_EPSILON = cfg.CLIP_EPSILON
+PPO_UPDATE_STEPS = cfg.UPDATE_STEPS
+PPO_GAE_LAMBDA = cfg.GAE_LAMBDA
+PPO_ENT_COEF = cfg.ENT_COEF
+PPO_VF_COEF = cfg.VF_COEF
+PPO_MAX_GRAD_NORM = cfg.MAX_GRAD_NORM
+PPO_BATCH_SIZE = cfg.BATCH_SIZE
+PPO_HIDDEN = cfg.HIDDEN_SIZE
+
+
+def _orthogonal_init(m, gain=1.0):
+    """
+    Initialize the given layer using orthogonal initialization.
+
+    Args:
+        m (nn.Module): A PyTorch module, typically an nn.Linear layer, 
+            whose weights and biases will be initialized.
+        gain (float, optional): Scaling factor applied to the orthogonal 
+            matrix. Default is 1.0.
+    """
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight, gain=gain)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
 class ActorCritic(nn.Module):
     """
-    Actor-Critic model for PPO with MultiDiscrete action space.
+    Actor-Critic neural network architecture for reinforcement learning.
+
+    This model contains two main components:
+    - Actor: Outputs action probabilities for each action dimension.
+    - Critic: Outputs the state-value estimate.
 
     Args:
-        state_dim: Dimension of the state space.
-        action_dims: List containing the number of discrete actions per action dimension.
-        hidden_size: Number of neurons in hidden layers.
+        state_dim (int): Dimension of the input state space.
+        action_dims (List[int]): List specifying the number of discrete 
+            actions for each action dimension (for MultiDiscrete action space).
+        hidden_size (int, optional): Number of hidden units per layer. 
+            Default is 64.
     """
-    def __init__(self, state_dim, action_dims, hidden_size=Config.HIDDEN_SIZE):
-        super(ActorCritic, self).__init__()
-        self.action_dims = action_dims
-
-        # Policy Network (Actor)
-        self.actor_fc = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
+    def __init__(self, state_dim: int, action_dims: List[int], hidden_size: int = 64):
+        super().__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
         )
-        self.action_heads = nn.ModuleList([nn.Linear(hidden_size, dim) for dim in action_dims])  # MultiDiscrete
-
-        # Value Network (Critic)
-        self.critic_fc = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
+        self.action_heads = nn.ModuleList([nn.Linear(hidden_size, d) for d in action_dims])
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, 1),
         )
-    
-    def forward(self, state):
+        self.actor.apply(lambda m: _orthogonal_init(m, gain=nn.init.calculate_gain('tanh')))
+        for h in self.action_heads: _orthogonal_init(h, gain=0.01)
+        self.critic.apply(lambda m: _orthogonal_init(m, gain=nn.init.calculate_gain('tanh')))
+
+    def forward(self, x: torch.Tensor):
         """
-        Forward pass through the Actor-Critic network.
+        Forward pass through the Actor-Critic model.
 
         Args:
-            state: Current state of the environment.
+            x (torch.Tensor): Input state tensor of shape (batch_size, state_dim) 
+                or (state_dim,) for a single state.
 
         Returns:
-            action_probs: Probability distributions for MultiDiscrete action dimensions.
-            value: Estimated state value.
+            probs (List[torch.Tensor]): A list of action probability distributions, 
+                one per action dimension.
+            v (torch.Tensor): Estimated state-value(s), scalar per input state.
         """
-        actor_features = self.actor_fc(state)
-        action_probs = [torch.softmax(head(actor_features), dim=-1) for head in self.action_heads]  # MultiDiscrete
-        value = self.critic_fc(state)
-        return action_probs, value
+        single = x.dim() == 1
+        if single:
+            x = x.unsqueeze(0)
+        feat = self.actor(x)
+        probs = [torch.softmax(h(feat), dim=-1) for h in self.action_heads]  # len==1
+        v = self.critic(x).squeeze(-1)
+        if single:
+            probs = [p[0] for p in probs]
+            v = v[0]
+        return probs, v
 
 class PPOAgent:
     """
-    PPO Agent with MultiDiscrete action space handling.
+    Proximal Policy Optimization (PPO) agent implementation.
 
-    This class implements the Proximal Policy Optimization (PPO) algorithm 
-    for environments with MultiDiscrete action spaces. The agent consists 
-    of an Actor-Critic model and uses the Generalized Advantage Estimation (GAE)
-    method for efficient policy updates.
+    This agent trains an Actor-Critic neural network using PPO, a policy gradient 
+    algorithm that stabilizes learning with clipping and advantage estimation.
 
     Args:
-        state_dim: Dimension of the state space.
-        action_dims: Number of discrete actions for each action dimension.
-        lr: Learning rate for the optimizer.
-        gamma: Discount factor for future rewards.
-        clip_epsilon: Clipping range for PPO.
-        update_steps: Number of training epochs per update.
+        state_dim (int): Dimension of the input state space.
+        action_dims (List[int]): List specifying the number of discrete actions per action dimension.
+        lr (float): Learning rate for the optimizer.
+        gamma (float): Discount factor for future rewards.
+        clip_epsilon (float): Clipping parameter for PPO objective.
+        update_steps (int): Number of epochs per update.
+        gae_lambda (float): Lambda parameter for Generalized Advantage Estimation (GAE).
+        ent_coef (float): Coefficient for entropy regularization (encourages exploration).
+        vf_coef (float): Coefficient for value function loss.
+        max_grad_norm (float): Maximum gradient norm for clipping.
+        hidden_size (int): Hidden layer size for Actor-Critic network.
+        batch_size (int): Mini-batch size for updates.
+        device (str): Device for computation ('cpu' or 'cuda').
+        target_kl (float): Target KL-divergence threshold for early stopping.
+        value_clip_eps (float): Clipping range for value function updates.
+        ent_decay (float): Decay factor for entropy coefficient.
+        lr_decay (float, optional): Learning rate decay factor.
     """
-    def __init__(self, state_dim, action_dims, lr=Config.LEARNING_RATE, gamma=Config.GAMMA, clip_epsilon=Config.CLIP_EPSILON, update_steps=Config.UPDATE_STEPS,
-                gae_lambda=Config.GAE_LAMBDA, ent_coef=Config.ENT_COEF, vf_coef=Config.VF_COEF, max_grad_norm=Config.MAX_GRAD_NORM, hidden_size=Config.HIDDEN_SIZE):
-        self.gamma = gamma
-        self.clip_epsilon = clip_epsilon
-        self.update_steps = update_steps
-        self.gae_lambda = gae_lambda          
-        self.ent_coef = ent_coef              
-        self.vf_coef = vf_coef                
-        self.max_grad_norm = max_grad_norm    
-        self.device = Config.DEVICE
-    
+    def __init__(
+        self,
+        state_dim: int = STATE_DIM,
+        action_dims: List[int] = None,
+        lr: float = PPO_LEARNING_RATE,
+        gamma: float = PPO_GAMMA,
+        clip_epsilon: float = PPO_CLIP_EPSILON,
+        update_steps: int = PPO_UPDATE_STEPS,
+        gae_lambda: float = PPO_GAE_LAMBDA,
+        ent_coef: float = PPO_ENT_COEF,
+        vf_coef: float = PPO_VF_COEF,
+        max_grad_norm: float = PPO_MAX_GRAD_NORM,
+        hidden_size: int = PPO_HIDDEN,
+        batch_size: int = PPO_BATCH_SIZE,
+        device: str = "cpu",
+        target_kl: float = 0.02,          
+        value_clip_eps: float = 0.2,      
+        ent_decay: float = 0.995,         
+        lr_decay: Optional[float] = 0.999 
+    ):
+        if action_dims is None:
+            action_dims = [N_ACTIONS]
+        self.device = torch.device(device)
+
+        self.gamma = float(gamma)
+        self.clip_epsilon = float(clip_epsilon)
+        self.update_steps = int(update_steps)
+        self.gae_lambda = float(gae_lambda)
+        self.ent_coef = float(ent_coef)
+        self.vf_coef = float(vf_coef)
+        self.max_grad_norm = float(max_grad_norm)
+        self.batch_size = int(batch_size)
+
+        self.target_kl = float(target_kl)
+        self.value_clip_eps = float(value_clip_eps)
+        self.ent_decay = float(ent_decay)
+        self.lr_decay = float(lr_decay) if lr_decay is not None else None
+
         self.policy = ActorCritic(state_dim, action_dims, hidden_size=hidden_size).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-        self.memory = []
-        
+        self.scheduler = (
+            optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.lr_decay)
+            if self.lr_decay is not None else None
+        )
+
+        self.memory: List[Tuple] = []
+        self.learn_time = 0.0
+
     def select_action(self, state):
         """
-        Selects an action for MultiDiscrete environments.
+        Select an action based on the current policy.
 
         Args:
-            state: Current state of the environment.
+            state (np.ndarray): Current environment state.
 
         Returns:
-            actions: Selected actions for each action dimension.
-            log_prob: Summed log probability of the selected actions because of multidiscrete environment.
+            acts (np.ndarray): Sampled action(s) from the policy distribution.
+            logps (torch.Tensor): Log probability of the chosen action(s).
         """
-        state = torch.tensor(state, dtype=torch.float32).to(self.device)
-        action_probs, _ = self.policy(state)
-        
-        actions = []
-        log_probs = []
-        for dist in action_probs:
-            categorical_dist = Categorical(dist)
-            action = categorical_dist.sample()
-            actions.append(action.item())
-            log_probs.append(categorical_dist.log_prob(action))
-        
-        return np.array(actions), torch.sum(torch.stack(log_probs)) 
-    
-    def store_transition(self, transition):
+        st = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            probs, _ = self.policy(st)
+        acts, logps = [], []
+        for p in probs:                
+            cat = Categorical(p)
+            a = cat.sample()
+            acts.append(int(a.item()))
+            logps.append(cat.log_prob(a))
+        return np.array(acts, dtype=np.int64), torch.sum(torch.stack(logps))
+
+    def store_transition(self, tr):
         """
-        Stores a transition in memory.
-        
+        Store a transition in memory.
+
         Args:
-        transition: A tuple containing:
-            - state: The current state.
-            - action: The action taken.
-            - reward: The reward received after taking the action.
-            - next_state: The state after taking the action.
-            - done: Whether the episode has ended.
-            - log_prob: The log probability of the selected action.
+            tr (Tuple): A tuple (state, action, reward, next_state, done, log_prob).
         """
-        self.memory.append(transition)
-    
+        self.memory.append(tr)
+
+    @staticmethod
+    def _compute_gae(r, v, v_next, d, gamma, lam):
+        """
+        Compute Generalized Advantage Estimation (GAE).
+
+        Args:
+            r (torch.Tensor): Rewards.
+            v (torch.Tensor): State value estimates.
+            v_next (torch.Tensor): Next state value estimates.
+            d (torch.Tensor): Done flags (1 if terminal state, else 0).
+            gamma (float): Discount factor.
+            lam (float): GAE lambda parameter.
+
+        Returns:
+            adv (torch.Tensor): Advantage estimates.
+        """
+        T = r.shape[0]
+        adv = torch.zeros(T, device=r.device)
+        gae = 0.0
+        for t in range(T - 1, -1, -1):
+            nd = 1.0 - d[t] 
+            delta = r[t] + gamma * v_next[t] * nd - v[t]
+            gae = delta + gamma * lam * nd * gae
+            adv[t] = gae
+        return adv
+
     def update(self):
         """
-        Performs PPO update using stored experience.
-
-        This function processes stored transitions, computes advantages,
-        and updates the policy and value networks using PPO loss.
-        """
-        if not self.memory:
-            print("Memory is empty.")
-            return
-        
-        states, actions, rewards, next_states, dones, log_probs_old = zip(*self.memory)
-        states = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
-        actions = torch.tensor(np.array(actions), dtype=torch.long, device=self.device)
-        rewards = torch.tensor(np.array(rewards), dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device)
-        dones = torch.tensor(np.array(dones), dtype=torch.float32, device=self.device)
-        log_probs_old = torch.tensor(np.array(log_probs_old), dtype=torch.float32, device=self.device)
-
-        _, values = self.policy(states)
-        _, next_values = self.policy(next_states)
-        not_dones = (1 - dones).unsqueeze(1)
-        next_values = (next_values * not_dones).clone()
-
-        advantages = self._compute_gae(rewards, values.detach().squeeze(), self.gamma, self.gae_lambda)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        value_target = rewards + self.gamma * next_values.view(-1).detach()
-
-        batch_size = Config.BATCH_SIZE  
-        dataset_size = len(states)
-        indices = np.arange(dataset_size)
-        np.random.shuffle(indices)
-
-        start_time = time.time()
-        for _ in range(self.update_steps):
-            for i in range(0, dataset_size, batch_size):
-                batch_indices = indices[i : i + batch_size]
-                batch_states = states[batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_log_probs_old = log_probs_old[batch_indices].detach().clone()
-                batch_value_target = value_target[batch_indices].detach().clone()
-
-                action_probs, values_new = self.policy(batch_states)
-                
-                log_probs_new = []
-                for j, dist in enumerate(action_probs):
-                    categorical_dist = Categorical(dist)
-                    log_probs_new.append(categorical_dist.log_prob(batch_actions[:, j]))
-                log_probs_new = torch.sum(torch.stack(log_probs_new), dim=0)
-                
-                ratio = torch.exp(log_probs_new - batch_log_probs_old)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                value_loss = nn.MSELoss()(values_new.view(-1), batch_value_target)
-                
-                entropy = torch.stack([
-                    Categorical(dist).entropy().mean() for dist in action_probs
-                ]).mean()
-                entropy_loss = -entropy
-                
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                
-                self.optimizer.zero_grad()
-                loss.backward(retain_graph=True)  
-                nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-                self.optimizer.step()
-                
-                self.learn_time=time.time()-start_time
-        
-        self.clip_epsilon = max(0.1, self.clip_epsilon * 0.995)
-        self.memory.clear()
-        
-        return self.learn_time
-    
-    def _compute_gae(self, rewards, values, gamma, lambda_):
-        """
-        Computes Generalized Advantage Estimation (GAE) for PPO.
-
-        Args:
-            rewards: Rewards obtained from environment.
-            values: Estimated values of the states.
-            gamma: Discount factor.
-            lambda_: Smoothing factor for GAE.
+        Perform a PPO update using stored transitions.
 
         Returns:
-            torch.Tensor: Computed advantage estimates.
+            learn_time (float): Time taken for the update (seconds).
+
+        Process:
+            1. Convert memory into tensors.
+            2. Compute advantages using GAE.
+            3. Optimize policy and value function with clipping.
+            4. Apply entropy regularization for exploration.
+            5. Use KL early stopping to prevent instability.
+            6. Optionally decay entropy coefficient and learning rate.
         """
-        advantages = torch.zeros_like(rewards, device=self.device)
-        gae = 0.0
-        N = len(rewards)
-        for t in reversed(range(N)):
-            v      = values[t]
-            next_v = values[t+1] if t < N-1 else torch.tensor(0.0, device=self.device)
-            delta  = rewards[t] + gamma * next_v - v
-            gae    = delta + gamma * lambda_ * gae
-            advantages[t] = gae
-        return advantages
-    
-    # Parallel Learning functions
-    def compute_loss(self):
         if not self.memory:
-            raise ValueError("Memory is empty.")
+            return 0.0
 
-        states, actions, rewards, next_states, dones, log_probs_old = zip(*self.memory)
-        states = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
-        actions = torch.tensor(np.array(actions), dtype=torch.long, device=self.device)
-        rewards = torch.tensor(np.array(rewards), dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device)
-        dones = torch.tensor(np.array(dones), dtype=torch.float32, device=self.device)
-        log_probs_old = torch.tensor(np.array(log_probs_old), dtype=torch.float32, device=self.device)
+        s, a, r, s2, d, lp = zip(*self.memory)
+        S  = torch.as_tensor(np.array(s),  dtype=torch.float32, device=self.device)
+        A  = torch.as_tensor(np.array(a),  dtype=torch.long,    device=self.device)   
+        R  = torch.as_tensor(np.array(r),  dtype=torch.float32, device=self.device)
+        S2 = torch.as_tensor(np.array(s2), dtype=torch.float32, device=self.device)
+        D  = torch.as_tensor(np.array(d),  dtype=torch.float32, device=self.device)
+        LP = torch.as_tensor(np.array(lp), dtype=torch.float32, device=self.device)
 
-        _, values = self.policy(states)
-        _, next_values = self.policy(next_states)
-        not_dones = (1 - dones).unsqueeze(1)
-        next_values = (next_values * not_dones).clone()
+        with torch.no_grad():
+            _, V  = self.policy(S)    
+            _, V2 = self.policy(S2)   
+            V2 = V2 * (1.0 - D)        
 
-        advantages = self._compute_gae(rewards, values.detach().squeeze(), self.gamma, self.gae_lambda)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        value_target = rewards + self.gamma * next_values.view(-1).detach()
-        
-        batch_size = Config.BATCH_SIZE  
-        dataset_size = len(states)
-        indices = np.arange(dataset_size)
-        np.random.shuffle(indices)
-        
+        ADV = self._compute_gae(R, V, V2, D, self.gamma, self.gae_lambda)  
+        ADV = (ADV - ADV.mean()) / (ADV.std() + 1e-8)
+        V_TGT = R + self.gamma * V2
+
+        t0 = time.time()
+        idx = np.arange(S.size(0))
         for _ in range(self.update_steps):
-            for i in range(0, dataset_size, batch_size):
-                batch_indices = indices[i : i + batch_size]
-                batch_states = states[batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_log_probs_old = log_probs_old[batch_indices].detach().clone()
-                batch_value_target = value_target[batch_indices].detach().clone()
-                action_probs, values_new = self.policy(batch_states)
-                log_probs_new = []
-                for j, dist in enumerate(action_probs):
-                    categorical_dist = Categorical(dist)
-                    log_probs_new.append(categorical_dist.log_prob(batch_actions[:, j]))
-                log_probs_new = torch.sum(torch.stack(log_probs_new), dim=0)
+            np.random.shuffle(idx)
+            approx_kl_epoch = 0.0
+            count_kl = 0
 
-                ratio = torch.exp(log_probs_new - batch_log_probs_old)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+            for i in range(0, len(idx), self.batch_size):
+                b = idx[i:i + self.batch_size]
+                st, act, oldp = S[b], A[b], LP[b].detach()
+                advb, vtgt = ADV[b], V_TGT[b].detach()
+                vold = V[b].detach()   
+
+                probs, vpred = self.policy(st)              
+                cat = Categorical(probs[0])
+                logp_new = cat.log_prob(act[:, 0])          
+                ratio = torch.exp(logp_new - oldp)          
+
+                surr1 = ratio * advb
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advb
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = nn.MSELoss()(values_new.view(-1), batch_value_target)
+                v_unclipped = (vpred - vtgt).pow(2)
+                v_clipped   = (vold + (vpred - vold).clamp(-self.value_clip_eps, self.value_clip_eps) - vtgt).pow(2)
+                value_loss  = torch.max(v_unclipped, v_clipped).mean()
 
-                entropy = torch.stack([
-                    Categorical(dist).entropy().mean() for dist in action_probs
-                ]).mean()
-                entropy_loss = -entropy
+                entropy = cat.entropy().mean()
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-        return loss
-    
-    # Parallel Learning functions
-    def apply_gradients(self, avg_gradients):
-        self.optimizer.zero_grad()
-        for name, param in self.policy.named_parameters():
-            if param.requires_grad:
-                param.grad = avg_gradients[name].to(param.device).clone()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.max_grad_norm)
-        self.optimizer.step()
-        self.clip_epsilon = max(0.1, self.clip_epsilon * 0.999)  # 천천히 줄이거나 아예 고정
+                loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
 
-    # Parallel Learning functions
-    def compute_gradients(self):
-        self.optimizer.zero_grad()
-        loss = self.compute_loss()  
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-        gradients = {name: param.grad.clone() for name, param in self.policy.named_parameters() if param.requires_grad}
-        return gradients
+                with torch.no_grad():
+                    kl = (oldp - logp_new).mean() 
+                    approx_kl_epoch += float(kl.item())
+                    count_kl += 1
+
+            if count_kl > 0:
+                mean_kl = approx_kl_epoch / count_kl
+                if mean_kl > self.target_kl:
+                    break
+
+        self.learn_time = time.time() - t0
+
+        self.clip_epsilon = max(0.10, self.clip_epsilon * 0.995)
+        self.ent_coef = max(0.0, self.ent_coef * self.ent_decay)
+        if self.scheduler is not None:
+            self.scheduler.step()
+
+        self.memory.clear()
+        return self.learn_time
+
+    def to(self, device: str):
+        """
+        Move the policy network and tensors to a specified device.
+
+        Args:
+            device (str): 'cpu' or 'cuda'.
+        """
+        self.device = torch.device(device)
+        self.policy.to(self.device)

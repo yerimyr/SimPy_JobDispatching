@@ -2,17 +2,17 @@ import optuna
 import torch
 from environment import JobRoutingGymEnv, Config
 from PPO import PPOAgent
-from main_PPO_parallel import evaluate
+from main_PPO_multiprocessing import evaluate
 
 def objective(trial):
     cfg = Config()
-    cfg.LEARNING_RATE = trial.suggest_loguniform("lr", 1e-5, 1e-1)
-    cfg.GAMMA = trial.suggest_uniform("gamma", 0.90, 0.999)
-    cfg.CLIP_EPSILON = trial.suggest_uniform("clip_epsilon", 0.01, 0.15)
-    cfg.GAE_LAMBDA = trial.suggest_uniform("gae_lambda", 0.8, 0.99)
-    cfg.ENT_COEF = trial.suggest_uniform("ent_coef", 0.0, 0.05)
-    cfg.VF_COEF = trial.suggest_uniform("vf_coef", 0.1, 1.0)
-    cfg.BATCH_SIZE = trial.suggest_categorical("batch_size", [16, 20, 32, 40])
+    cfg.LEARNING_RATE = trial.suggest_loguniform("lr", 1e-5, 3e-3)
+    cfg.GAMMA = trial.suggest_uniform("gamma", 0.95, 0.995)
+    cfg.CLIP_EPSILON = trial.suggest_uniform("clip_epsilon", 0.1, 0.25)
+    cfg.GAE_LAMBDA = trial.suggest_uniform("gae_lambda", 0.9, 0.98)
+    cfg.ENT_COEF = trial.suggest_uniform("ent_coef", 0, 0.1)
+    cfg.VF_COEF = trial.suggest_uniform("vf_coef", 0.5, 1.0)
+    cfg.BATCH_SIZE = trial.suggest_categorical("batch_size", [20, 32, 40, 64])
     cfg.HIDDEN_SIZE = trial.suggest_categorical("hidden_size", [16, 32, 48, 64])
 
     env = JobRoutingGymEnv(cfg)
@@ -34,7 +34,7 @@ def objective(trial):
         hidden_size=cfg.HIDDEN_SIZE   
     )
 
-    N_EPISODES = 2000   
+    N_EPISODES = 5000   
     NUM_JOBS = cfg.NUM_JOBS
     total_timesteps = NUM_JOBS * N_EPISODES
 
