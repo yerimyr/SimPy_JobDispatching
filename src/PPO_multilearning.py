@@ -23,7 +23,6 @@ PPO_BATCH_SIZE = cfg.BATCH_SIZE
 PPO_HIDDEN = cfg.HIDDEN_SIZE
 
 
-# ====== 유틸: 직교 초기화 ======
 def _orthogonal_init(m, gain=1.0):
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=gain)
@@ -31,12 +30,12 @@ def _orthogonal_init(m, gain=1.0):
             nn.init.constant_(m.bias, 0)
 
 
-# ====== 액터-크리틱 네트워크 ======
 class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dims: List[int], hidden_size: int = 64):
         super().__init__()
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
             nn.Linear(hidden_size, hidden_size), nn.Tanh(),
         )
         self.action_heads = nn.ModuleList([nn.Linear(hidden_size, d) for d in action_dims])
@@ -44,10 +43,10 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_size), nn.Tanh(),
             nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
             nn.Linear(hidden_size, 1),
         )
 
-        # init
         self.actor.apply(lambda m: _orthogonal_init(m, gain=nn.init.calculate_gain('tanh')))
         for h in self.action_heads:
             _orthogonal_init(h, gain=0.01)
@@ -59,7 +58,7 @@ class ActorCritic(nn.Module):
             x = x.unsqueeze(0)
 
         feat = self.actor(x)
-        probs = [torch.softmax(h(feat), dim=-1) for h in self.action_heads]  # MultiDiscrete 지원(여기선 1개)
+        probs = [torch.softmax(h(feat), dim=-1) for h in self.action_heads]  
         v = self.critic(x).squeeze(-1)
 
         if single:
@@ -68,7 +67,6 @@ class ActorCritic(nn.Module):
         return probs, v
 
 
-# ====== PPO Agent ======
 class PPOAgent:
     def __init__(
         self,
@@ -95,7 +93,6 @@ class PPOAgent:
 
         self.device = torch.device(device)
 
-        # 하이퍼
         self.gamma = float(gamma)
         self.clip_epsilon = float(clip_epsilon)
         self.update_steps = int(update_steps)
@@ -110,7 +107,6 @@ class PPOAgent:
         self.ent_decay = float(ent_decay)
         self.lr_decay = float(lr_decay) if lr_decay is not None else None
 
-        # 네트워크/옵티마이저
         self.policy = ActorCritic(state_dim, action_dims, hidden_size=hidden_size).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.scheduler = (
@@ -121,7 +117,6 @@ class PPOAgent:
         self.memory: List[Tuple] = []
         self.learn_time = 0.0
 
-    # ====== 액션 샘플 ======
     def select_action(self, state):
         st = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -134,11 +129,9 @@ class PPOAgent:
             logps.append(cat.log_prob(a))
         return np.array(acts, dtype=np.int64), torch.sum(torch.stack(logps))
 
-    # ====== 메모리 ======
     def store_transition(self, tr):
         self.memory.append(tr)
 
-    # ====== GAE ======
     @staticmethod
     def _compute_gae(r, v, v_next, d, gamma, lam):
         T = r.shape[0]
@@ -151,7 +144,6 @@ class PPOAgent:
             adv[t] = gae
         return adv
 
-    # ====== (기존) 단일 프로세스 업데이트 ======
     def update(self):
         if not self.memory:
             return 0.0
@@ -187,7 +179,7 @@ class PPOAgent:
                 vold = V[b].detach()
 
                 probs, vpred = self.policy(st)
-                # 액션 차원 1개(Discrete)
+
                 cat = Categorical(probs[0])
                 logp_new = cat.log_prob(act[:, 0])
                 ratio = torch.exp(logp_new - oldp)
@@ -220,7 +212,6 @@ class PPOAgent:
 
         self.learn_time = time.time() - t0
 
-        # 스케줄/감쇠
         self.clip_epsilon = max(0.10, self.clip_epsilon * 0.995)
         self.ent_coef = max(0.0, self.ent_coef * self.ent_decay)
         if self.scheduler is not None:
@@ -229,7 +220,6 @@ class PPOAgent:
         self.memory.clear()
         return self.learn_time
 
-    # ====== (신규) 병렬 학습용: 손실 계산 ======
     def compute_loss(self) -> torch.Tensor:
         if not self.memory:
             raise ValueError("Memory is empty.")
@@ -251,7 +241,7 @@ class PPOAgent:
         V_TGT = R + self.gamma * V2
 
         probs, Vp = self.policy(S)
-        cat = Categorical(probs[0])  # 단일 Discrete
+        cat = Categorical(probs[0])  
         logp_new = cat.log_prob(A[:, 0])
 
         ratio = torch.exp(logp_new - LP)
@@ -265,7 +255,6 @@ class PPOAgent:
         loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
         return loss
 
-    # ====== (신규) 병렬 학습용: 그래디언트 계산 ======
     def compute_gradients(self) -> Dict[str, torch.Tensor]:
         self.optimizer.zero_grad()
         loss = self.compute_loss()
@@ -274,24 +263,18 @@ class PPOAgent:
         grads = {n: (p.grad.detach().clone()) for n, p in self.policy.named_parameters() if p.requires_grad}
         return grads
 
-    # ====== (신규) 병렬 학습용: 평균 그래디언트 적용 ======
     def apply_gradients(self, avg_gradients: Dict[str, torch.Tensor]):
         self.optimizer.zero_grad()
         for name, param in self.policy.named_parameters():
             if param.requires_grad and name in avg_gradients:
-                # 평균 그라디언트 적용
                 param.grad = avg_gradients[name].to(self.device).detach().clone()
         self.optimizer.step()
 
-        # 전역 step 후 감쇠 파라미터 갱신(원하면 유지/조정 가능)
         self.clip_epsilon = max(0.10, self.clip_epsilon * 0.995)
         self.ent_coef = max(0.0, self.ent_coef * self.ent_decay)
         if self.scheduler is not None:
             self.scheduler.step()
 
-        # 워커 메모리는 메인에서 관리하지 않으므로 여기선 비우지 않음(워커에서 자체적으로 clear 권장)
-
-    # ====== 디바이스 이동 ======
     def to(self, device: str):
         self.device = torch.device(device)
         self.policy.to(self.device)
