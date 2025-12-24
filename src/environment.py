@@ -82,7 +82,7 @@ class JobRoutingSimPyEnv:
             r.append(remain)
             q.append(qk)
         obs = np.array(
-            r + q + [float(self.jobs_completed), float(self.env.now)],  # env.now = 시간 단위
+            r + q + [float(self.jobs_completed), float(self.env.now)],  
             dtype=np.float32
         )
         self.last_obs = obs
@@ -179,5 +179,4 @@ class JobRoutingGymEnv(gym.Env):
         return obs, reward, done, False, info
 
     def render(self):
-        # env.now은 이제 '시간 단위'임
         print(f"t={self.core.env.now:.2f} h, obs={self.core.last_obs}, completed={self.core.jobs_completed}")

@@ -7,7 +7,6 @@ import torch.optim as optim
 from torch.distributions import Categorical
 from environment import Config
 
-# ====== 하이퍼파라미터 로딩 ======
 cfg = Config()
 STATE_DIM = cfg.STATE_DIM
 N_ACTIONS = cfg.N_ACTIONS

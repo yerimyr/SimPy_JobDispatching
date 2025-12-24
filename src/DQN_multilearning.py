@@ -1,4 +1,3 @@
-# DQN_multilearning.py
 import random
 import numpy as np
 import torch
@@ -6,9 +5,6 @@ import torch.nn as nn
 import torch.optim as optim
 
 
-# ==========================================
-# Replay Buffer
-# ==========================================
 class ReplayBuffer:
     def __init__(self, capacity=50000):
         self.capacity = capacity
@@ -38,9 +34,6 @@ class ReplayBuffer:
         )
 
 
-# ==========================================
-# Q-Network
-# ==========================================
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=64):
         super().__init__()
@@ -57,9 +50,6 @@ class QNetwork(nn.Module):
         return self.net(x)
 
 
-# ==========================================
-# DQN Agent (멀티러닝 + device 지원)
-# ==========================================
 class DQNAgent:
     def __init__(
         self,
@@ -76,9 +66,7 @@ class DQNAgent:
         target_update_interval=1000,
         device="cpu",
     ):
-        # -----------------------------------------
-        # 기본 설정
-        # -----------------------------------------
+        
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
@@ -91,31 +79,17 @@ class DQNAgent:
         self.target_update_interval = target_update_interval
         self.learn_step = 0
 
-        # -----------------------------------------
-        # 디바이스
-        # -----------------------------------------
         self.device = torch.device(device)
 
-        # -----------------------------------------
-        # 네트워크
-        # -----------------------------------------
         self.q_network = QNetwork(state_dim, action_dim, hidden).to(self.device)
         self.target_network = QNetwork(state_dim, action_dim, hidden).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
 
-        # -----------------------------------------
-        # 옵티마이저
-        # -----------------------------------------
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
 
-        # -----------------------------------------
-        # Replay Buffer
-        # -----------------------------------------
         self.replay_buffer = ReplayBuffer(capacity=50000)
 
-    # -----------------------------------------
-    # 행동 선택 (epsilon-greedy)
-    # -----------------------------------------
+
     def select_action(self, state):
         if random.random() < self.epsilon:
             return random.randrange(self.action_dim)
@@ -124,15 +98,11 @@ class DQNAgent:
         q_values = self.q_network(s)
         return int(q_values.argmax().item())
 
-    # -----------------------------------------
-    # epsilon decay
-    # -----------------------------------------
+
     def decay_epsilon(self):
         self.epsilon = max(self.eps_min, self.epsilon * self.eps_decay)
 
-    # -----------------------------------------
-    # compute gradients (worker)
-    # -----------------------------------------
+
     def compute_gradients(self, batch_size=None):
         if batch_size is None:
             batch_size = self.batch_size
@@ -182,25 +152,18 @@ class DQNAgent:
 
         return grads
 
-    # -----------------------------------------
-    # apply gradients (server)
-    # -----------------------------------------
+
     def apply_gradients(self, grad_dict):
         self.optimizer.zero_grad()
 
         for name, param in self.q_network.named_parameters():
             if param.requires_grad and (name in grad_dict):
-                # grad_dict는 CPU tensor → device로 이동해야 함
                 param.grad = grad_dict[name].to(self.device)
 
         self.optimizer.step()
         self.target_network.load_state_dict(self.q_network.state_dict())
 
-    # -----------------------------------------
-    # 네트워크 디바이스 이동
-    # -----------------------------------------
     def to(self, device):
-        """기존 PPO처럼 to(device) 기능 추가."""
         device = torch.device(device)
         self.device = device
         self.q_network.to(device)

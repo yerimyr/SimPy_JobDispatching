@@ -72,7 +72,6 @@ def _worker_rollout(args):
     return episodes_traj, ep_sample_times
 
 
-# --- 새 함수: Pool 재사용 버전 ---
 def _collect_transitions_with_pool(pool, weights_blob, n_workers, episodes_per_worker, max_steps, inference_device):
     tasks = [(wid, weights_blob, episodes_per_worker, max_steps, inference_device)
              for wid in range(n_workers)]
@@ -134,7 +133,6 @@ def main(mode: str = "C", workers: int = 5):
 
     ep = 0
 
-    # --- Pool을 한 번만 생성 ---
     pool = Pool(processes=int(workers))
     try:
         while ep < N_EPISODES:

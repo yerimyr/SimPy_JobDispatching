@@ -11,7 +11,7 @@ from DQN_multilearning import DQNAgent
 
 
 cfg = Config()
-N_EPISODES        = 5000
+N_EPISODES        = 1
 MAX_STEPS_PER_EP  = cfg.NUM_JOBS
 STATE_DIM         = cfg.STATE_DIM
 N_ACTIONS         = cfg.N_ACTIONS
@@ -42,7 +42,7 @@ def simulation_worker(args):
         action_dim=N_ACTIONS,
         device=actor_device,
     )
-
+    
     actor_agent.q_network.load_state_dict(model_state_dict)
     actor_agent.target_network.load_state_dict(model_state_dict)
 
